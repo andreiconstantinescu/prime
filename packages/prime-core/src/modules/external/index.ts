@@ -8,7 +8,8 @@ import {
   GraphQLUnionType,
   printSchema,
 } from 'graphql';
-import { camelCase, omit, pick, upperFirst } from 'lodash';
+import { camelCase, omit, upperFirst } from 'lodash';
+import { createResolversMap } from 'type-graphql/dist/utils/createResolversMap';
 import Container from 'typedi';
 import { Connection, getRepository } from 'typeorm';
 import { Schema, SchemaVariant } from '../../entities/Schema';
@@ -23,6 +24,7 @@ import { createSchemaConnectionType } from './types/createSchemaConnectionType';
 import { createSchemaInputType } from './types/createSchemaInputType';
 import { createSchemaType } from './types/createSchemaType';
 import { DocumentRemove } from './types/DocumentRemove';
+import { createDemo } from './utils/createDemo';
 import { resetTypeNames, uniqueTypeName } from './utils/uniqueTypeNames';
 
 export const log = debug('prime:external');
@@ -95,6 +97,12 @@ export const createExternal = async (connection: Connection) => {
     mutations[`create${name}`] = await createSchemaInputType(payload, SchemaType, CREATE);
     mutations[`update${name}`] = await createSchemaInputType(payload, SchemaType, UPDATE);
     mutations[`remove${name}`] = DocumentRemove;
+
+    queries[name].resolve = resolvers[name];
+    queries[`all${name}`].resolve = resolvers[`all${name}`];
+    mutations[`create${name}`].resolve = resolvers[`create${name}`];
+    mutations[`update${name}`].resolve = resolvers[`update${name}`];
+    mutations[`remove${name}`].resolve = resolvers[`remove${name}`];
   }
 
   const primeDocumentNotFoundTypeName = uniqueTypeName('Prime_Document_NotFound');
@@ -105,6 +113,7 @@ export const createExternal = async (connection: Connection) => {
   types.set(primeDocumentNotFoundTypeName, { type: PrimeDocumentNotFound });
 
   const primeDocumentTypeName = uniqueTypeName('Prime_Document');
+  resolvers[primeDocumentTypeName] = documentUnionResolver(resolvers);
   queries[primeDocumentTypeName] = {
     args: {
       id: { type: GraphQLString },
@@ -114,60 +123,82 @@ export const createExternal = async (connection: Connection) => {
       name: primeDocumentTypeName,
       types: Array.from(types.values()).map(typeConfig => typeConfig.type),
     }),
+    resolve: resolvers[primeDocumentTypeName],
   };
-
-  resolvers[primeDocumentTypeName] = documentUnionResolver(resolvers);
 
   const hasMutations = Object.keys(mutations).length;
 
-  const typeDefs = printSchema(
-    new GraphQLSchema({
-      query: new GraphQLObjectType({
-        name: 'Query',
-        fields: queries,
-      }),
-      ...(hasMutations && {
-        mutation: new GraphQLObjectType({
-          name: 'Mutation',
-          fields: mutations,
-        }),
-      }),
-    })
-  );
+  // lets have fun
+  queries.Demo = createDemo();
 
-  // Extract type field resolvers
-  const typeFieldResolvers = Array.from(types.entries()).reduce((acc, [key, value]) => {
-    if (value && value.type) {
-      const fields = value.type.getFields();
-      const typeResolvers = Object.entries(fields).reduce((acc2, [key2, value2]: any) => {
-        if (value2 && value2.resolve) {
-          acc2[key2] = value2.resolve;
+  const gqlschema = new GraphQLSchema({
+    query: new GraphQLObjectType({
+      name: 'Query',
+      fields: queries,
+    }),
+    ...(hasMutations && {
+      mutation: new GraphQLObjectType({
+        name: 'Mutation',
+        fields: mutations,
+      }),
+    }),
+  });
+
+  const typeDefs = printSchema(gqlschema);
+  const resolverMap = createResolversMap(gqlschema);
+
+  const mapResolver = obj => {
+    const res = {};
+    for (const key in obj) {
+      if (obj[key]) {
+        const value = obj[key] as any;
+        if (typeof value.serialize === 'function') {
+          // noop
+        } else if (value.resolve) {
+          res[key] = value.resolve;
+        } else if (value.__resolveType) {
+          res[key] = value;
+        } else {
+          const firstFieldType = Object.values(value);
+          if (value && typeof firstFieldType[0] === 'string') {
+            // noop
+          } else {
+            res[key] = mapResolver(value);
+          }
         }
-        return acc2;
-      }, {});
-      if (Object.keys(typeResolvers).length) {
-        acc[key] = typeResolvers;
       }
+    }
+    return res;
+  };
+  typeDefs;
+  mapResolver;
+  resolverMap;
+
+  const unionResolvers = Object.entries(resolverMap).reduce((acc, item) => {
+    const [key, value] = item as any;
+    if (key && value.__resolveType) {
+      acc[key] = value;
     }
     return acc;
   }, {});
 
   return new GraphQLModule({
     name: 'prime-external',
-    typeDefs,
-    resolvers: {
-      Query: {
-        [primeDocumentTypeName]: queries[primeDocumentTypeName],
-        ...pick(resolvers, Object.keys(queries)),
-      },
-      ...typeFieldResolvers,
-      ...(hasMutations && { Mutation: pick(resolvers, Object.keys(mutations)) }),
-      [primeDocumentTypeName]: {
-        __resolveType({ __typeOf }) {
-          return __typeOf;
-        },
-      },
-    },
+    extraSchemas: [gqlschema],
+    resolvers: unionResolvers,
+    // {
+    //   // @todo add all union type resolvers (somehow...)
+    //   Prime_Document: {
+    //     __resolveType({ __typeOf }) {
+    //       return __typeOf;
+    //     },
+    //   },
+    //   DemoUnion: {
+    //     __resolveType({ __inputname }) {
+    //       return __inputname;
+    //     }
+    //   }
+    // },
     context() {
       const requestId = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
       log('requestId', requestId);
